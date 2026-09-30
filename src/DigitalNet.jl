@@ -15,6 +15,9 @@ the leading `m` columns do.
 `sample(n, d, DigitalNetSample(generating_matrices))` requires
 `d ≤ size(generating_matrices, 1)` and `n ≤ 2^size(generating_matrices, 2)`. Each
 coordinate keeps as many leading bits as the output type `T` can represent exactly.
+An unsigned `T` returns the digits themselves: each coordinate is a left-aligned word
+holding its leading `8 * sizeof(T)` binary digits, randomized by `R` on the words, which
+`NoRand` and a base-2 [`HashOwenScramble`](@ref) support.
 
 The second form reads the generating matrices from `file`, a path or an `IO`, in the
 `dnet` format of [LDData](https://github.com/QMCSoftware/LDData) or in LatNet
@@ -80,7 +83,23 @@ function DigitalNetSample(file::Union{AbstractString, IO}; R::RandomizationMetho
 end
 
 function sample(n::Integer, d::Integer, S::DigitalNetSample, T::Type = Float64)
-    C = S.generating_matrices
+    return randomize(_digits2unif.(T, _digital_net_digits(n, d, S.generating_matrices)), S.R)
+end
+
+function sample(n::Integer, d::Integer, S::DigitalNetSample, ::Type{T}) where {T <: Unsigned}
+    if !(S.R isa Union{NoRand, HashOwenScramble})
+        throw(ArgumentError("digit words support NoRand and HashOwenScramble, not $(typeof(S.R))"))
+    end
+    return randomize(_leading_digits.(T, _digital_net_digits(n, d, S.generating_matrices)), S.R)
+end
+
+"""
+    _digital_net_digits(n, d, C)
+
+The first `n` points of the digital net with generating matrices `C` in its leading `d`
+dimensions, as left-aligned words of `eltype(C)`: a `d × n` matrix.
+"""
+function _digital_net_digits(n::Integer, d::Integer, C::AbstractMatrix{<:Unsigned})
     if n < 0
         throw(ArgumentError("number of samples must be non-negative"))
     end
@@ -101,7 +120,20 @@ function sample(n::Integer, d::Integer, S::DigitalNetSample, T::Type = Float64)
         # `i & (i - 1)` clears the lowest set bit of `i`, so that point precedes point `i`.
         digits[:, i + 1] .= digits[:, (i & (i - 1)) + 1] .⊻ C[1:d, trailing_zeros(i) + 1]
     end
-    return randomize(_digits2unif.(T, digits), S.R)
+    return digits
+end
+
+"""
+    _leading_digits(T, x::Unsigned)
+
+The left-aligned word `x` as a left-aligned `T`: its leading `8 * sizeof(T)` digits, padded
+with zeros when `T` is the wider type.
+"""
+function _leading_digits(::Type{T}, x::U) where {T <: Unsigned, U <: Unsigned}
+    if sizeof(T) <= sizeof(U)
+        return (x >> (8 * (sizeof(U) - sizeof(T)))) % T
+    end
+    return T(x) << (8 * (sizeof(T) - sizeof(U)))
 end
 
 """

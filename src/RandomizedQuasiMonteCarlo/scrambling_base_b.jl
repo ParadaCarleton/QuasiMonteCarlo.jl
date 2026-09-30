@@ -208,7 +208,9 @@ and the seed, never on the other points, so
   - the first `n` points of a scrambled sequence are the scrambled first `n` points: extending
     a sample keeps the points already drawn.
 
-It costs `O(pad)` hashes per coordinate and stores no permutation tables.
+It costs `O(pad)` hashes per coordinate and stores no permutation tables. In base 2
+with `pad` no larger than the float's precision, the points are scrambled as packed
+digit words, with no digit array; `randomize` also takes such words directly (below).
 
 References: Owen, A. B. (1995), as for [`OwenScramble`](@ref); Burley, B. (2020). Practical
 Hash-based Owen Scrambling. Journal of Computer Graphics Techniques, 9(4), 1-20.
@@ -262,6 +264,90 @@ function randomize_bits!(
         end
     end
     return random_bits
+end
+
+"""
+    randomize(words::AbstractMatrix{<:Unsigned}, R::HashOwenScramble)
+
+`R`'s scramble of left-aligned base-2 digit words, one word per coordinate of the
+`d × n` point matrix `words`. The leading `R.pad` digits of each word are scrambled as the
+matching fraction's digits would be, and the digits after them are cleared, so
+`randomize(words, R) ./ 2^w` equals `randomize(words ./ 2^w, R)` for `w`-bit words whenever
+the floats hold `pad` digits. Needs `R.base == 2` and `R.pad ≤ 8 * sizeof(eltype(words))`.
+
+# Examples
+
+```jldoctest
+julia> using QuasiMonteCarlo, Random
+
+julia> words = sample(4, 2, DigitalNetSample(UInt32[0x80000000 0x40000000; 0x80000000 0xc0000000]), UInt32);
+
+julia> randomize(words, HashOwenScramble(base = 2, rng = Xoshiro(1))) ./ 2.0^32 ==
+           randomize(words ./ 2.0^32, HashOwenScramble(base = 2, rng = Xoshiro(1)))
+true
+```
+"""
+function randomize(words::AbstractMatrix{U}, R::HashOwenScramble) where {U <: Unsigned}
+    if R.base != 2
+        throw(ArgumentError("digit words are base 2, but the scramble has base $(R.base)"))
+    end
+    if !(0 <= R.pad <= 8 * sizeof(U))
+        throw(ArgumentError("pad = $(R.pad) digits do not fit in a $(8 * sizeof(U))-bit word"))
+    end
+    seed = rand(R.rng, UInt64)
+    random_words = similar(words)
+    for s in axes(words, 1)
+        key = splitmix64(seed ⊻ splitmix64(UInt64(s)))
+        for i in axes(words, 2)
+            random_words[s, i] = hash_owen_word(words[s, i], key, R.pad)
+        end
+    end
+    return random_words
+end
+
+"""
+    hash_owen_word(word, key, pad)
+
+`HashOwenScramble`'s base-2 scramble, under one dimension's `key`, of the leading `pad`
+digits of the left-aligned `word`, with the digits after them cleared.
+"""
+function hash_owen_word(word::U, key::UInt64, pad::Integer) where {U <: Unsigned}
+    width = 8 * sizeof(U)
+    node = key # the hash of the digits above digit k
+    scrambled = zero(U)
+    for k in 1:pad
+        digit = (word >> (width - k)) & one(U)
+        # The top bit of `node` is `node * 2 / 2^64`, the base-2 shift.
+        scrambled |= (digit ⊻ (node >> 63) % U) << (width - k)
+        node = splitmix64(node + (UInt64(digit) + 1) * 0x9e3779b97f4a7c15)
+    end
+    return scrambled
+end
+
+function randomize!(
+        random_points::AbstractMatrix{T},
+        points::AbstractMatrix{T}, R::HashOwenScramble
+    ) where {T <: AbstractFloat}
+    pad = Int(R.pad)
+    if R.base != 2 || pad > min(64, precision(T)) || !all(x -> 0 <= x < 1, points)
+        # Digits past the float's precision, or points outside [0, 1): the digit arrays.
+        return invoke(
+            randomize!, Tuple{AbstractMatrix{T}, AbstractMatrix{T}, ScrambleMethod},
+            random_points, points, R
+        )
+    end
+    @assert size(points) == size(random_points)
+    # `points` holds one point per row here; the words hold one per column. Both
+    # conversions are exact, as the float holds all `pad` digits.
+    words = [
+        UInt64(floor(ldexp(points[i, s], pad))) << (64 - pad)
+            for s in axes(points, 2), i in axes(points, 1)
+    ]
+    random_words = randomize(words, R)
+    for s in axes(points, 2), i in axes(points, 1)
+        random_points[i, s] = ldexp(T(random_words[s, i] >> (64 - pad)), -pad)
+    end
+    return
 end
 
 """
