@@ -742,22 +742,25 @@ end
     wide = QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol), UInt64)
     @test wide == UInt64.(words) .<< 32
 
-    # Bit for bit at pad = 32: the words, the floats routed through words, and the digit arrays.
+    # Bit for bit at pad = 32: the words, the floats routed through words, and the digit
+    # arrays. A float scramble is the midpoint of its cell, half a last digit above the word.
     for seed in 1:3
         reference = digit_array_scramble(points, R(seed))
-        @test randomize(words, R(seed)) ./ 2.0^32 == reference
-        @test randomize(wide, R(seed)) ./ 2.0^64 == reference
+        @test (randomize(words, R(seed)) .+ 0.5) ./ 2.0^32 == reference
+        @test (randomize(wide, R(seed)) .+ 2.0^31) ./ 2.0^64 == reference
         @test randomize(points, R(seed)) == reference
     end
     # A shorter pad clears the digits after it; Float32 holds the leading 24 digits exactly.
     single = Float32.(words .>> 8) ./ 2.0f0^24
-    @test randomize(words, R(5; pad = 20)) ./ 2.0f0^32 == digit_array_scramble(single, R(5; pad = 20))
+    @test (randomize(words, R(5; pad = 20)) .+ 2.0f0^11) ./ 2.0f0^32 == digit_array_scramble(single, R(5; pad = 20))
     @test randomize(single, R(5; pad = 20)) == digit_array_scramble(single, R(5; pad = 20))
+    # At pad = 24 the midpoint needs a 25th digit, so both paths keep 23 digits.
+    @test randomize(single, R(5; pad = 24)) == digit_array_scramble(single, R(5; pad = 24))
 
     scrambled(count) = QuasiMonteCarlo.sample(count, d, DigitalNetSample(sobol; R = R(7)), UInt32)
     # A longer scrambled sample keeps the points of a shorter one.
     @test scrambled(n)[:, 1:37] == scrambled(37)
-    @test scrambled(n) ./ 2.0^32 == QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol; R = R(7)))
+    @test (scrambled(n) .+ 0.5) ./ 2.0^32 == QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol; R = R(7)))
 
     @test_throws ArgumentError randomize(words, HashOwenScramble(base = 3, pad = 20))
     @test_throws ArgumentError randomize(words, R(1; pad = 33))

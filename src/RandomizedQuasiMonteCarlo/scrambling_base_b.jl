@@ -271,9 +271,11 @@ end
 
 `R`'s scramble of left-aligned base-2 digit words, one word per coordinate of the
 `d × n` point matrix `words`. The leading `R.pad` digits of each word are scrambled as the
-matching fraction's digits would be, and the digits after them are cleared, so
-`randomize(words, R) ./ 2^w` equals `randomize(words ./ 2^w, R)` for `w`-bit words whenever
-the floats hold `pad` digits. Needs `R.base == 2` and `R.pad ≤ 8 * sizeof(eltype(words))`.
+matching fraction's digits would be, and the digits after them are cleared. A float
+scramble returns the midpoint of each scrambled cell (see `bits2unif`), so for `w`-bit
+words `(randomize(words, R) .+ 2^(w - pad - 1)) ./ 2^w` equals `randomize(words ./ 2^w, R)`
+whenever the floats hold `pad + 1` digits. Needs `R.base == 2` and
+`R.pad ≤ 8 * sizeof(eltype(words))`.
 
 # Examples
 
@@ -282,7 +284,7 @@ julia> using QuasiMonteCarlo, Random
 
 julia> words = sample(4, 2, DigitalNetSample(UInt32[0x80000000 0x40000000; 0x80000000 0xc0000000]), UInt32);
 
-julia> randomize(words, HashOwenScramble(base = 2, rng = Xoshiro(1))) ./ 2.0^32 ==
+julia> (randomize(words, HashOwenScramble(base = 2, rng = Xoshiro(1))) .+ 0.5) ./ 2.0^32 ==
            randomize(words ./ 2.0^32, HashOwenScramble(base = 2, rng = Xoshiro(1)))
 true
 ```
@@ -337,15 +339,19 @@ function randomize!(
         )
     end
     @assert size(points) == size(random_points)
-    # `points` holds one point per row here; the words hold one per column. Both
-    # conversions are exact, as the float holds all `pad` digits.
+    # `points` holds one point per row here; the words hold one per column. Reading the
+    # words is exact, as the float holds all `pad` digits.
     words = [
         UInt64(floor(ldexp(points[i, s], pad))) << (64 - pad)
             for s in axes(points, 2), i in axes(points, 1)
     ]
     random_words = randomize(words, R)
+    # As in `bits2unif`: the midpoint of the cell of the leading `m` digits, the most `T`
+    # holds with room for the midpoint, so `2k + 1` and `2^(m + 1)` are exact in `T`.
+    m = min(pad, precision(T) - 1)
     for s in axes(points, 2), i in axes(points, 1)
-        random_points[i, s] = ldexp(T(random_words[s, i] >> (64 - pad)), -pad)
+        k = T(random_words[s, i] >> (64 - m))
+        random_points[i, s] = ldexp(2k + 1, -(m + 1))
     end
     return
 end
