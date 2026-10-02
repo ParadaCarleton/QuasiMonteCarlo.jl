@@ -839,6 +839,25 @@ end
     @test_throws ArgumentError QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol; R = Scramble(base = 3, pad = 20)), UInt32)
 end
 
+@testset "$Scramble held as scrambled generating matrices and shifts samples the same points" for Scramble in (MatousekScramble, DigitalShift)
+    d, n = 4, 64
+    sobol = SobolSeq(d).m .<< (32 .- (1:32)')
+    for pad in (32, 20)
+        direct = QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol; R = Scramble(base = 2, pad = pad, rng = Xoshiro(3))), UInt32)
+        matrices, shifts = QuasiMonteCarlo.scramble_generators(sobol, d, Scramble(base = 2, pad = pad, rng = Xoshiro(3)))
+        held = DigitalNetSample(matrices; shift = shifts)
+        @test QuasiMonteCarlo.sample(n, d, held, UInt32) == direct
+        # A longer sample keeps a shorter one's points, and fewer dimensions the leading ones.
+        @test QuasiMonteCarlo.sample(2n, d, held, UInt32)[:, 1:n] == direct
+        @test QuasiMonteCarlo.sample(n, 2, held, UInt32) == direct[1:2, :]
+        # Floats are the left ends of the cells of the leading 32 digits.
+        @test QuasiMonteCarlo.sample(n, d, held, Float64) == Float64.(direct) ./ 2.0^32
+    end
+    sobol_held = DigitalNetSample(sobol; shift = zeros(UInt32, d - 1))
+    @test_throws ArgumentError QuasiMonteCarlo.sample(n, d, sobol_held, UInt32)
+    @test_throws ArgumentError DigitalNetSample(sobol; R = Scramble(base = 2, pad = 32), shift = zeros(UInt32, d))
+end
+
 @testset "MatousekScramble and DigitalShift do not depend on the thread count" begin
     d = 4
     sobol = SobolSeq(d).m .<< (32 .- (1:32)')

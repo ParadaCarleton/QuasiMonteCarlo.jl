@@ -512,6 +512,8 @@ function scramble_generators(
     return scrambled, last.(draws)
 end
 
+@public scramble_generators
+
 """
     draw_digit_words(rng, R::DigitalMatrixScramble, U)
 
