@@ -766,3 +766,98 @@ end
     @test_throws ArgumentError randomize(words, R(1; pad = 33))
     @test_throws ArgumentError QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol; R = OwenScramble(base = 2)), UInt32)
 end
+
+"""`count` points of the first `dims` dimensions of the net with `generating_matrices`, scrambled by `Scramble`."""
+function scrambled_words(generating_matrices, Scramble, count, dims, seed, pad)
+    R = Scramble(base = 2, pad = pad, rng = Xoshiro(seed))
+    return QuasiMonteCarlo.sample(count, dims, DigitalNetSample(generating_matrices; R), UInt32)
+end
+
+"""The sorted numbers of points in each box of the grid that splits dimension `s` into `2^splits[s]` cells."""
+function box_counts(words, splits)
+    counts = Dict{Vector{UInt32}, Int}()
+    for point in eachcol(words)
+        box = UInt32[word >> (32 - split) for (word, split) in zip(point, splits)]
+        counts[box] = get(counts, box, 0) + 1
+    end
+    return sort!(collect(values(counts)))
+end
+
+@testset "$Scramble scrambles a digital net into a shifted digital net" for Scramble in (MatousekScramble, DigitalShift)
+    d, m = 4, 6
+    n = 2^m
+    sobol = SobolSeq(d).m .<< (32 .- (1:32)')
+    plain = QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol), UInt32)
+    words = scrambled_words(sobol, Scramble, n, d, 3, 32)
+    @test words != plain
+
+    # Scrambling the generating matrices is the scramble of the points, for the same draws.
+    for pad in (32, 20, 5)
+        scramble = Scramble(base = 2, pad = pad, rng = Xoshiro(3))
+        @test QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol; R = scramble)) ==
+            randomize(QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol)), Scramble(base = 2, pad = pad, rng = Xoshiro(3)))
+    end
+
+    # Affine over GF(2): a ⊕ b ⊕ (any point) is again a point, so the points of each
+    # dimension are a shifted subspace of dimension m.
+    for dimension in axes(words, 1)
+        points = Set(words[dimension, :])
+        anchor = words[dimension, begin]
+        @test length(points) == n
+        @test all((a ⊻ b ⊻ anchor) in points for a in points for b in points)
+    end
+
+    # A longer sample keeps the points of a shorter one, and a wider one the dimensions of a
+    # narrower one; the digits after `pad` are cleared.
+    @test scrambled_words(sobol, Scramble, 2n, d, 3, 32)[:, 1:37] == scrambled_words(sobol, Scramble, 37, d, 3, 32)
+    @test scrambled_words(sobol, Scramble, n, d, 3, 32)[1:2, :] == scrambled_words(sobol, Scramble, n, 2, 3, 32)
+    @test all(iszero, scrambled_words(sobol, Scramble, n, d, 3, 20) .& 0x00000fff)
+
+    # The leading digits of a scrambled point depend on the leading digits alone.
+    cells = rand(Xoshiro(1), 0:(2^10 - 1), 1, 200)
+    coarse = (cells .+ rand(Xoshiro(2), 0:(2^22 - 1), 1, 200) ./ 2^22) ./ 2^10
+    fine = (cells .+ rand(Xoshiro(3), 0:(2^22 - 1), 1, 200) ./ 2^22) ./ 2^10
+    leading = Scramble(base = 2, pad = 32, rng = Xoshiro(4))
+    @test floor.(Int, randomize(coarse, leading) .* 2^10) == floor.(Int, randomize(fine, Scramble(base = 2, pad = 32, rng = Xoshiro(4))) .* 2^10)
+    @test randomize(coarse, Scramble(base = 2, pad = 32, rng = Xoshiro(4))) != randomize(fine, Scramble(base = 2, pad = 32, rng = Xoshiro(4)))
+
+    # Box counts are those of the unscrambled net: one point per elementary interval in the
+    # first two dimensions, and the same counts as the unscrambled net in all four.
+    for first_digits in 0:m
+        @test box_counts(words[1:2, :], (first_digits, m - first_digits)) == ones(Int, n)
+    end
+    for splits in Iterators.product(fill(0:m, d)...)
+        sum(splits) == m || continue
+        @test box_counts(words, splits) == box_counts(plain, splits)
+    end
+
+    # Each scrambled point is uniform: its mean over 4000 seeds is within 4 standard errors of ½.
+    draws = [scrambled_words(sobol, Scramble, 2, 1, seed, 32)[1, 2] / 2.0^32 for seed in 1:4000]
+    @test abs(mean(draws) - 0.5) < 4 * sqrt(1 / 12 / length(draws))
+
+    @test_throws ArgumentError scrambled_words(sobol, Scramble, n, d, 3, 33)
+    @test_throws ArgumentError QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol; R = Scramble(base = 3, pad = 20)), UInt32)
+end
+
+@testset "MatousekScramble and DigitalShift do not depend on the thread count" begin
+    d = 4
+    sobol = SobolSeq(d).m .<< (32 .- (1:32)')
+    for Scramble in (MatousekScramble, DigitalShift)
+        serial = [scrambled_words(sobol, Scramble, 64, d, seed, 32) for seed in 1:8]
+        tasks = [Threads.@spawn(scrambled_words(sobol, Scramble, 64, d, seed, 32)) for seed in 1:8]
+        @test fetch.(tasks) == serial
+    end
+
+    # Whole processes with one thread and with four give the same points.
+    script = """
+    using QuasiMonteCarlo, Random, Sobol
+    sobol = SobolSeq(4).m .<< (32 .- (1:32)')
+    for Scramble in (MatousekScramble, DigitalShift)
+        R = Scramble(base = 2, pad = 32, rng = Xoshiro(5))
+        println(join(QuasiMonteCarlo.sample(64, 4, DigitalNetSample(sobol; R), UInt32), ","))
+    end
+    """
+    project = dirname(Base.active_project())
+    output(threads) = read(`$(Base.julia_cmd()) --project=$project -t $threads -e $script`, String)
+    @test output(1) == output(4)
+end
