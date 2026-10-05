@@ -208,7 +208,7 @@ dimensions of a `d`-dimensional sample are the `k`-dimensional sample's. In base
 scrambled points of a digital net are a digital net (with generating matrices `M C`)
 shifted by `c`. `pad` is the number of digits used for each point. A [`DigitalNetSample`](@ref)
 applies the scramble to its generating matrices, which costs `O(pad²)` per column rather than
-per point ([`scramble_generators`](@ref)).
+per point (`scramble_generators`).
 
 References: Matoušek, J. (1998). On thel2-discrepancy for anchored boxes. Journal of Complexity, 14(4), 527-556.
 """
@@ -374,7 +374,7 @@ function digits_to_word(::Type{U}, digits::AbstractVector{<:Integer}) where {U <
     return word
 end
 
-"""Digit `k` of the product is the parity of `masks[k]` ANDed with `word`: a matrix-vector product over GF(2)."""
+"""Digit `k` of the product is the parity of `masks[k] & word`: a matrix-vector product over GF(2)."""
 function multiply_digits(masks::AbstractVector{U}, word::U) where {U <: Unsigned}
     product = zero(U)
     for (position, mask) in enumerate(masks)

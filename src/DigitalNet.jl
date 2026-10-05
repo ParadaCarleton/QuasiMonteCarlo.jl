@@ -18,12 +18,12 @@ coordinate keeps as many leading bits as the output type `T` can represent exact
 An unsigned `T` returns the digits themselves: each coordinate is a left-aligned word
 holding its leading `8 * sizeof(T)` binary digits. `R` may be `NoRand`,
 [`MatousekScramble`](@ref) or [`DigitalShift`](@ref), which are applied to the generating
-matrices (`L C`, then a digit shift XORed into every point, [`scramble_generators`](@ref))
+matrices (`L C`, then a digit shift XORed into every point, `scramble_generators`)
 rather than to the sampled points: the same points as `randomize` gives, from `O(pad²)`
 work per column rather than per point, keeping `pad` digits.
 
 A `shift` (one left-aligned word per dimension, `R = NoRand()`) is XORed into every point
-of the net instead: with the matrices and shifts [`scramble_generators`](@ref) returns, it
+of the net instead: with the matrices and shifts `scramble_generators` returns, it
 generates the points of a scramble from the few kilobytes it is held in, one XOR per
 coordinate, equal to sampling with that scramble.
 
@@ -190,7 +190,7 @@ end
 
 The first `n` points of the digital net with generating matrices `C` in its leading `d`
 dimensions, scrambled by `R`: the net of the scrambled generating matrices
-([`scramble_generators`](@ref)) shifted by `R`'s digit shift, as `_digital_net_digits`.
+(`scramble_generators`) shifted by `R`'s digit shift, as `_digital_net_digits`.
 """
 function _scrambled_net_digits(
         n::Integer, d::Integer, C::AbstractMatrix{<:Unsigned}, R::DigitalMatrixScramble
