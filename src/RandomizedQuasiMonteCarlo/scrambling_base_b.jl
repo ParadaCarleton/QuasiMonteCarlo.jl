@@ -14,8 +14,8 @@ scrambled, and `pad` must be at least `log(base, n)` for a point set with `n`
 points. The `randomize` interface preserves the matrix size and keeps points in
 the unit box.
 
-The package provides [`DigitalShift`](@ref), [`MatousekScramble`](@ref), and
-[`OwenScramble`](@ref). New implementations should add methods to the generic
+The package provides [`DigitalShift`](@ref), [`MatousekScramble`](@ref),
+[`OwenScramble`](@ref), and [`HashOwenScramble`](@ref). New implementations should add methods to the generic
 `randomize`/`randomize!` interface rather than changing sampler methods.
 
 # Examples
@@ -36,6 +36,7 @@ The scramble methods implementer are
   - `DigitalShift`.
   - `OwenScramble`: Nested Uniform Scramble which was introduced in Owen (1995).
   - `MatousekScramble`: Linear Matrix Scramble which was introduced in Matousek (1998).
+  - `HashOwenScramble`: Nested Uniform Scramble with hashed permutations (Burley 2020).
 """
 abstract type ScrambleMethod <: RandomizationMethod end
 
@@ -187,6 +188,175 @@ function randomize!(
 end
 
 """
+    HashOwenScramble(base::Integer; pad = 32, rng = Random.TaskLocalRNG()) <: ScrambleMethod
+
+Nested Uniform Scramble whose permutations are hashed rather than stored.
+
+# Fields
+
+- `base::Integer`: Base of the digital net being scrambled.
+- `pad::Integer = 32`: Number of base-`base` digits retained for each point.
+- `rng::AbstractRNG = Random.TaskLocalRNG()`: Random-number generator from which each
+  `randomize` call draws one 64-bit seed.
+
+Digit `k` of a coordinate is shifted modulo `base` by a hash of the seed, the dimension
+and the `k - 1` digits above it: the same nested scramble as [`OwenScramble`](@ref),
+applied to all `pad` digits. The scramble of a point therefore depends only on the point
+and the seed, never on the other points, so
+
+  - any number of points can be scrambled (`OwenScramble` needs `n` to be a power of `base`), and
+  - the first `n` points of a scrambled sequence are the scrambled first `n` points: extending
+    a sample keeps the points already drawn.
+
+It costs `O(pad)` hashes per coordinate and stores no permutation tables. In base 2
+with `pad` no larger than the float's precision, the points are scrambled as packed
+digit words, with no digit array; `randomize` also takes such words directly (below).
+
+References: Owen, A. B. (1995), as for [`OwenScramble`](@ref); Burley, B. (2020). Practical
+Hash-based Owen Scrambling. Journal of Computer Graphics Techniques, 9(4), 1-20.
+
+# Examples
+
+```jldoctest
+julia> using QuasiMonteCarlo, Random
+
+julia> points = sample(8, 2, SobolSample());
+
+julia> short = randomize(points[:, 1:3], HashOwenScramble(base = 2, rng = Xoshiro(1)));
+
+julia> randomize(points, HashOwenScramble(base = 2, rng = Xoshiro(1)))[:, 1:3] == short
+true
+```
+"""
+Base.@kwdef struct HashOwenScramble{I <: Integer} <: ScrambleMethod
+    base::I
+    pad::I = 32
+    rng::AbstractRNG = Random.TaskLocalRNG()
+end
+
+"""SplitMix64's output function: a bijective avalanche of 64 bits."""
+function splitmix64(value::Unsigned)
+    x = UInt64(value) + 0x9e3779b97f4a7c15
+    x = (x ⊻ (x >> 30)) * 0xbf58476d1ce4e5b9
+    x = (x ⊻ (x >> 27)) * 0x94d049bb133111eb
+    return x ⊻ (x >> 31)
+end
+
+function randomize_bits!(
+        random_bits::AbstractArray{T, 3},
+        origin_bits::AbstractArray{T, 3},
+        R::HashOwenScramble
+    ) where {T <: Integer}
+    pad, n, d = size(origin_bits)
+    b = UInt64(R.base)
+    seed = rand(R.rng, UInt64)
+    for s in 1:d
+        key = splitmix64(seed ⊻ splitmix64(UInt64(s)))
+        for i in 1:n
+            node = key # the hash of the digits above digit k
+            for k in 1:pad
+                digit = origin_bits[k, i, s]
+                # `node * b / 2^64`, a uniform shift in 0:(b - 1).
+                shift = (widemul(node, b) >> 64) % UInt64
+                random_bits[k, i, s] = (digit + T(shift)) % R.base
+                node = splitmix64(node + (UInt64(digit) + 1) * 0x9e3779b97f4a7c15)
+            end
+        end
+    end
+    return random_bits
+end
+
+"""
+    randomize(words::AbstractMatrix{<:Unsigned}, R::HashOwenScramble)
+
+`R`'s scramble of left-aligned base-2 digit words, one word per coordinate of the
+`d × n` point matrix `words`. The leading `R.pad` digits of each word are scrambled as the
+matching fraction's digits would be, and the digits after them are cleared. A float
+scramble returns the midpoint of each scrambled cell (see `bits2unif`), so for `w`-bit
+words `(randomize(words, R) .+ 2^(w - pad - 1)) ./ 2^w` equals `randomize(words ./ 2^w, R)`
+whenever the floats hold `pad + 1` digits. Needs `R.base == 2` and
+`R.pad ≤ 8 * sizeof(eltype(words))`.
+
+# Examples
+
+```jldoctest
+julia> using QuasiMonteCarlo, Random
+
+julia> words = sample(4, 2, DigitalNetSample(UInt32[0x80000000 0x40000000; 0x80000000 0xc0000000]), UInt32);
+
+julia> (randomize(words, HashOwenScramble(base = 2, rng = Xoshiro(1))) .+ 0.5) ./ 2.0^32 ==
+           randomize(words ./ 2.0^32, HashOwenScramble(base = 2, rng = Xoshiro(1)))
+true
+```
+"""
+function randomize(words::AbstractMatrix{U}, R::HashOwenScramble) where {U <: Unsigned}
+    if R.base != 2
+        throw(ArgumentError("digit words are base 2, but the scramble has base $(R.base)"))
+    end
+    if !(0 <= R.pad <= 8 * sizeof(U))
+        throw(ArgumentError("pad = $(R.pad) digits do not fit in a $(8 * sizeof(U))-bit word"))
+    end
+    seed = rand(R.rng, UInt64)
+    random_words = similar(words)
+    for s in axes(words, 1)
+        key = splitmix64(seed ⊻ splitmix64(UInt64(s)))
+        for i in axes(words, 2)
+            random_words[s, i] = hash_owen_word(words[s, i], key, R.pad)
+        end
+    end
+    return random_words
+end
+
+"""
+    hash_owen_word(word, key, pad)
+
+`HashOwenScramble`'s base-2 scramble, under one dimension's `key`, of the leading `pad`
+digits of the left-aligned `word`, with the digits after them cleared.
+"""
+function hash_owen_word(word::U, key::UInt64, pad::Integer) where {U <: Unsigned}
+    width = 8 * sizeof(U)
+    node = key # the hash of the digits above digit k
+    scrambled = zero(U)
+    for k in 1:pad
+        digit = (word >> (width - k)) & one(U)
+        # The top bit of `node` is `node * 2 / 2^64`, the base-2 shift.
+        scrambled |= (digit ⊻ (node >> 63) % U) << (width - k)
+        node = splitmix64(node + (UInt64(digit) + 1) * 0x9e3779b97f4a7c15)
+    end
+    return scrambled
+end
+
+function randomize!(
+        random_points::AbstractMatrix{T},
+        points::AbstractMatrix{T}, R::HashOwenScramble
+    ) where {T <: AbstractFloat}
+    pad = Int(R.pad)
+    if R.base != 2 || pad > min(64, precision(T)) || !all(x -> 0 <= x < 1, points)
+        # Digits past the float's precision, or points outside [0, 1): the digit arrays.
+        return invoke(
+            randomize!, Tuple{AbstractMatrix{T}, AbstractMatrix{T}, ScrambleMethod},
+            random_points, points, R
+        )
+    end
+    @assert size(points) == size(random_points)
+    # `points` holds one point per row here; the words hold one per column. Reading the
+    # words is exact, as the float holds all `pad` digits.
+    words = [
+        UInt64(floor(ldexp(points[i, s], pad))) << (64 - pad)
+            for s in axes(points, 2), i in axes(points, 1)
+    ]
+    random_words = randomize(words, R)
+    # As in `bits2unif`: the midpoint of the cell of the leading `m` digits, the most `T`
+    # holds with room for the midpoint, so `2k + 1` and `2^(m + 1)` are exact in `T`.
+    m = min(pad, precision(T) - 1)
+    for s in axes(points, 2), i in axes(points, 1)
+        k = T(random_words[s, i] >> (64 - m))
+        random_points[i, s] = ldexp(2k + 1, -(m + 1))
+    end
+    return
+end
+
+"""
     MatousekScramble(base::Integer; pad = 32, rng = Random.TaskLocalRNG()) <: ScrambleMethod
 
 Linear Matrix Scramble, also known as Matousek's scramble.
@@ -199,8 +369,16 @@ Linear Matrix Scramble, also known as Matousek's scramble.
   the scramble.
 
 `randomize(x, R::MatousekScramble)` returns a scrambled version of `x`.
-The scramble method is Linear Matrix Scramble which was introduced in Matousek (1998).
-`pad` is the number of bits used for each point. One needs `pad ≥ log(base, n)`.
+The scramble method is Linear Matrix Scramble which was introduced in Matousek (1998):
+in each dimension the `pad` digits `a` of a point become `M a + c` modulo `base`, where `M`
+is a random lower-triangular `pad × pad` matrix with non-zero diagonal and `c` a random
+digit vector. The matrix and shift are drawn from `rng` in dimension order, whatever the
+number of points, so a longer sample keeps the points of a shorter one and the first `k`
+dimensions of a `d`-dimensional sample are the `k`-dimensional sample's. In base 2 the
+scrambled points of a digital net are a digital net (with generating matrices `M C`)
+shifted by `c`. A [`DigitalNetSample`](@ref) applies the scramble to its generating
+matrices, which costs `O(pad²)` per column rather than per point, and returns each
+coordinate truncated to its first `pad` digits, as floats at the midpoint of their cell.
 
 References: Matoušek, J. (1998). On thel2-discrepancy for anchored boxes. Journal of Complexity, 14(4), 527-556.
 """
@@ -223,30 +401,16 @@ function randomize_bits!(
         R::MatousekScramble
     ) where {T <: Integer}
     # https://statweb.stanford.edu/~owen/mc/ Chapter 17.6 around equation (17.15).
-    #
-    pad, n, d = size(origin_bits)
-    b = R.base
-    rng = R.rng
-    m = logi(b, n)
-    @assert m ≥ 1 "We need m ≥ 1" # m=0 causes awkward corner case below.  Caller handles that case specially.
-
+    pad, _, d = size(origin_bits)
     for s in 1:d
-        # Permutations matrix and shift to apply to bits 1:m
-        matousek_M, matousek_C = getmatousek(rng, m, b)
+        # A pad × pad matrix and shift per dimension, drawn in dimension order.
+        matousek_M, matousek_C = getmatousek(R.rng, pad, R.base)
 
         # xₖ = (∑ₗ Mₖₗ aₗ + Cₖ) mod b where xₖ is the k element in base b
-        # matousek_M (m×m) * origin_bits (m×n) .+ matousek_C (m×1)
-        @views random_bits[1:m, :, s] .= (
-            matousek_M * origin_bits[1:m, :, s] .+
-                matousek_C
-        ) .% b
+        # matousek_M (pad×pad) * origin_bits (pad×n) .+ matousek_C (pad×1)
+        @views random_bits[:, :, s] .= (matousek_M * origin_bits[:, :, s] .+ matousek_C) .% R.base
     end
-
-    # Paste in random entries for bits after m'th one
-    return if pad > m
-        # random_bits[(m + 1):pad, :, :] = rand(rng, 0:(b - 1), n * d * (pad - m))
-        rand!(rng, @view(random_bits[(m + 1):pad, :, :]), 0:(b - 1))
-    end
+    return random_bits
 end
 
 """
@@ -282,8 +446,12 @@ Digital shift.
   the shift.
 
 The scramble method is Digital Shift.
-It scrambles each coordinate in base `b` as `yₖ = (xₖ + Uₖ) mod b` where `Uₖ ∼ 𝕌({0:b-1})`.
-`U` is the same for every point `points` but i.i.d. along every dimension.
+It scrambles each coordinate in base `b` as `yₖ = (xₖ + Uₖ) mod b` where `Uₖ ∼ 𝕌({0:b-1})`
+for each of the `pad` digits `k`. `U` is the same for every point `points` but i.i.d. along
+every dimension, and drawn from `rng` in dimension order, so a point's scramble depends on
+the point and the first draws of `rng` alone: it does not depend on the number of points
+and the first `k` dimensions of a `d`-dimensional sample are the `k`-dimensional sample's.
+On the generating matrices of a [`DigitalNetSample`](@ref) it is applied to the matrices.
 """
 Base.@kwdef struct DigitalShift{I <: Integer} <: ScrambleMethod
     base::I
@@ -297,25 +465,88 @@ function randomize_bits!(
         R::DigitalShift
     ) where {T <: Integer}
     # https://statweb.stanford.edu/~owen/mc/ Chapter 17.6 around equation (17.15).
-    #
-    pad, n, d = size(origin_bits)
-    b = R.base
-    rng = R.rng
-    m = logi(b, n)
-    @assert m ≥ 1 "We need m ≥ 1" # m=0 causes awkward corner case below.  Caller handles that case specially.
-
+    pad, _, d = size(origin_bits)
     for s in 1:d
-        # Permutations matrix and shift to apply to bits 1:m
-        DS = rand(rng, 0:(b - 1), m)
-
-        # xₖ = (aₖ + Cₖ) mod b where xₖ is the k element in base b
-        # origin_bits (m×n) .+ DS (m×1)
-        @views random_bits[1:m, :, s] .= (origin_bits[1:m, :, s] .+ DS) .% b
+        # One shift of all `pad` digits per dimension, drawn in dimension order.
+        digit_shift = rand(R.rng, 0:(R.base - 1), pad)
+        @views random_bits[:, :, s] .= (origin_bits[:, :, s] .+ digit_shift) .% R.base
     end
+    return random_bits
+end
 
-    # Paste in random entries for bits after m'th one
-    return if pad > m
-        # random_bits[(m + 1):pad, :, :] = rand(rng, 0:(b - 1), n * d * (pad - m))
-        rand!(rng, @view(random_bits[(m + 1):pad, :, :]), 0:(b - 1))
+const DigitalMatrixScramble = Union{MatousekScramble, DigitalShift}
+
+"""
+    scramble_generators(generating_matrices::AbstractMatrix{U}, d::Integer, R::DigitalMatrixScramble)
+
+The generating matrices of the first `d` dimensions of a base-2 digital net, scrambled by
+`R`, and the digit shift to add to every point. In dimension `s`, with `pad` the number of
+digits, the matrix `L` and the shift `c` that `randomize_bits!` draws from `R.rng`, in
+dimension order, give the columns `L C` and the shift `c`. The points of the scrambled net
+are the XORs of its columns selected by the digits of the point's index, XORed with `c`, so
+they equal the scramble of the unscrambled points. Only the first `pad` digits of each
+column and shift are kept. It costs `O(pad²)` per column, not per point.
+
+The generating matrices are left-aligned `U` words; returns the scrambled matrices and a
+vector of shifts, one per dimension.
+"""
+function scramble_generators(
+        generating_matrices::AbstractMatrix{U}, d::Integer, R::DigitalMatrixScramble
+    ) where {U <: Unsigned}
+    width = 8 * sizeof(U)
+    pad = Int(R.pad)
+    if R.base != 2
+        throw(ArgumentError("digital nets are base 2, but the scramble has base $(R.base)"))
     end
+    if !(1 <= pad <= width)
+        throw(ArgumentError("pad = $pad digits do not fit in a $width-bit word"))
+    end
+    # Dimension order, so the first `k` dimensions are the same for every `d ≥ k`.
+    draws = [draw_digit_words(R.rng, R, U) for _ in 1:d]
+    scrambled = stack(
+        [
+            [multiply_digits(masks, word) for word in generators]
+                for ((masks, _), generators) in zip(draws, eachrow(@view generating_matrices[1:d, :]))
+        ]; dims = 1
+    )
+    return scrambled, last.(draws)
+end
+
+@public scramble_generators
+
+"""
+    draw_digit_words(rng, R::DigitalMatrixScramble, U)
+
+One dimension's scramble of `R` as left-aligned words of type `U`: the rows of the
+lower-triangular matrix, as bit masks over the digits (row `k` is a mask whose parity with
+a word gives digit `k` of the product), and the shift.
+"""
+function draw_digit_words(rng::AbstractRNG, R::MatousekScramble, ::Type{U}) where {U <: Unsigned}
+    matrix, shift = getmatousek(rng, Int(R.pad), R.base)
+    masks = [digits_to_word(U, row) for row in eachrow(matrix)]
+    return masks, digits_to_word(U, shift)
+end
+
+function draw_digit_words(rng::AbstractRNG, R::DigitalShift, ::Type{U}) where {U <: Unsigned}
+    shift = rand(rng, 0:(R.base - 1), Int(R.pad))
+    identity_masks = [one(U) << (8 * sizeof(U) - digit) for digit in 1:Int(R.pad)]
+    return identity_masks, digits_to_word(U, shift)
+end
+
+"""The left-aligned word of type `U` whose leading binary digits are `digits`."""
+function digits_to_word(::Type{U}, digits::AbstractVector{<:Integer}) where {U <: Unsigned}
+    word = zero(U)
+    for (position, digit) in enumerate(digits)
+        word |= U(digit) << (8 * sizeof(U) - position)
+    end
+    return word
+end
+
+"""Digit `k` of the product is the parity of `masks[k] & word`: a matrix-vector product over GF(2)."""
+function multiply_digits(masks::AbstractVector{U}, word::U) where {U <: Unsigned}
+    product = zero(U)
+    for (position, mask) in enumerate(masks)
+        product |= U(count_ones(mask & word) & 1) << (8 * sizeof(U) - position)
+    end
+    return product
 end
