@@ -23,7 +23,7 @@ holding its leading `8 * sizeof(T)` binary digits, randomized by `R` on the word
 return floats as the midpoints of the cells of their first `pad` digits.
 
 A `shift` (one left-aligned word per dimension, `R = NoRand()`) is XORed into every point
-of the net instead: with the matrices and shifts [`scramble_generators`](@ref) returns, it
+of the net instead: with the matrices and shifts `scramble_generators` returns, it
 generates the points of a scramble from the few kilobytes it is held in, one XOR per
 coordinate, equal to sampling with that scramble. Floats are then the left ends of the cells
 of their leading digits.
@@ -191,7 +191,7 @@ end
 
 The first `n` points of the digital net with generating matrices `C` in its leading `d`
 dimensions, scrambled by `R`: the net of the scrambled generating matrices
-([`scramble_generators`](@ref)) shifted by `R`'s digit shift, as `_digital_net_digits`.
+(`scramble_generators`) shifted by `R`'s digit shift, as `_digital_net_digits`.
 """
 function _scrambled_net_digits(
         n::Integer, d::Integer, C::AbstractMatrix{<:Unsigned}, R::DigitalMatrixScramble

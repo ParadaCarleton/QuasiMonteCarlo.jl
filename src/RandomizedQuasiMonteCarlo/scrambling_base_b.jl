@@ -542,7 +542,7 @@ function digits_to_word(::Type{U}, digits::AbstractVector{<:Integer}) where {U <
     return word
 end
 
-"""Digit `k` of the product is the parity of `masks[k]` ANDed with `word`: a matrix-vector product over GF(2)."""
+"""Digit `k` of the product is the parity of `masks[k] & word`: a matrix-vector product over GF(2)."""
 function multiply_digits(masks::AbstractVector{U}, word::U) where {U <: Unsigned}
     product = zero(U)
     for (position, mask) in enumerate(masks)
