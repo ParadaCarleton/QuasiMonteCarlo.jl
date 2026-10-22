@@ -4,6 +4,7 @@ using Test
 using Statistics, LinearAlgebra, StatsBase, Random
 using Primes, Combinatorics, Distributions, IntervalArithmetic
 using HypothesisTests
+using Sobol: SobolSeq
 
 # struct InertSampler <: Random.AbstractRNG end
 # InertSampler(args...; kwargs...) = InertSampler()
@@ -236,6 +237,55 @@ end
     end
 end
 
+@testset "DigitalNetSample" begin
+    d, m = 5, 8
+    n = 2^m
+    # Sobol.jl's direction integers satisfy m[j, k] < 2^k; left-align them in 32 bits.
+    sobol = SobolSeq(d).m .<< (32 .- (1:32)')
+    net = QuasiMonteCarlo.sample(2n, d, DigitalNetSample(sobol))
+    # SobolSample skips the first n - 1 points and runs in Gray-code order, so its n
+    # points are points n, ..., 2n - 1 of the digital sequence, at the Gray-code indices.
+    @test QuasiMonteCarlo.sample(n, d, SobolSample()) ==
+        net[:, [(k ⊻ (k >> 1)) + 1 for k in n:(2n - 1)]]
+
+    function stratified(points)
+        # Each coordinate puts exactly one point in each interval [k, k + 1) / n.
+        strata = 0:(size(points, 2) - 1)
+        return all(sort(floor.(Int, row .* size(points, 2))) == strata for row in eachrow(points))
+    end
+    @test stratified(net[:, 1:n])
+    owen = OwenScramble(base = 2, pad = 32, rng = MersenneTwister(1776))
+    scrambled = QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol; R = owen))
+    @test stratified(scrambled)
+    @test scrambled != net[:, 1:n]
+
+    # Float32 keeps only the bits it can hold, so an all-ones coordinate stays below 1.
+    @test QuasiMonteCarlo.sample(2, 1, DigitalNetSample(fill(typemax(UInt64), 1, 1)), Float32) ==
+        [0.0f0 prevfloat(1.0f0)]
+
+    # LatNet Builder `-O net` output for the Joe-Kuo nets, cut to 3 dimensions and 5 columns.
+    latnet = """
+    # Parameters for a digital net in base 2
+    3    # s = 3 dimensions
+    5    # k = 5,  n = 2^5 = 32 points
+    31   # r = 31 binary output digits
+    # Columns of gen. matrices C_1,...,C_s, one matrix per line
+    1073741824 536870912 268435456 134217728 67108864
+    1073741824 1610612736 1342177280 2013265920 1140850688
+    1073741824 1610612736 805306368 1207959552 1946157056
+    """
+    @test QuasiMonteCarlo.sample(32, 3, DigitalNetSample(IOBuffer(latnet))) == net[1:3, 1:32]
+    # LDData's `dnet` format adds the base to the same layout.
+    dnet = "# dnet\n2    # base b = 2\n" * latnet
+    @test QuasiMonteCarlo.sample(32, 3, DigitalNetSample(IOBuffer(dnet))) == net[1:3, 1:32]
+    @test_throws ArgumentError DigitalNetSample(IOBuffer(replace(dnet, "\n2 " => "\n3 ")))
+
+    @test QuasiMonteCarlo.sample(64, 2, DigitalNetSample(sobol[:, 1:6])) == net[1:2, 1:64]
+    @test_throws ArgumentError QuasiMonteCarlo.sample(65, 2, DigitalNetSample(sobol[:, 1:6]))
+    @test_throws ArgumentError QuasiMonteCarlo.sample(n, d + 1, DigitalNetSample(sobol))
+    @test_throws ArgumentError QuasiMonteCarlo.sample(-1, d, DigitalNetSample(sobol))
+end
+
 @testset "Faure Sample" begin
     #FaureSample()
     d = 17
@@ -397,6 +447,7 @@ end
         SobolSample(),
         LatticeRuleSample(R = Shift()),
         SobolSample(R = MatousekScramble(base = 2, pad = m)),
+        SobolSample(R = HashOwenScramble(base = 2, pad = m)),
     ]
     for algorithm in algorithms
         Ms = QuasiMonteCarlo.generate_design_matrices(n, lb, ub, algorithm, num_mat)
@@ -425,6 +476,7 @@ end
         SobolSample(R = OwenScramble(base = 2, pad = m)),
         SobolSample(R = MatousekScramble(base = 2, pad = m)),
         SobolSample(R = DigitalShift(base = 2, pad = m)),
+        SobolSample(R = HashOwenScramble(base = 2, pad = m)),
     ]
     for algorithm in algorithms
         @show algorithm
@@ -453,6 +505,7 @@ end
                 OwenScramble(base = b, pad = pad)
                 MatousekScramble(base = b, pad = pad)
                 DigitalShift(base = b, pad = pad)
+                HashOwenScramble(base = b, pad = pad)
             ]
             for scrambling in scramblings
                 output,
@@ -484,13 +537,39 @@ end
     x = (0 // 16):(1 // 16):(15 // 16)
     bits = QuasiMonteCarlo.unif2bits(x, b)
     y = [QuasiMonteCarlo.bits2unif(s, b) for s in eachcol(bits)]
-    @test x == y
+    # the midpoint of the cell of width 2^-32 given by the 32 bits
+    @test y == x .+ 2.0^-33
 
     b = 3
     x = (0 // 27):(1 // 27):(26 // 27)
     bits = QuasiMonteCarlo.unif2bits(x, b, pad = 8)
     y = [QuasiMonteCarlo.bits2unif(Rational, s, b) for s in eachcol(bits)]
     @test x == y
+end
+
+@testset "bits2unif stays strictly inside (0, 1)" begin
+    for T in (Float16, Float32, Float64), b in (2, 3, 5, 7), pad in (4, 32, 64)
+        # all digits b - 1 summed to 1.0f0 in Float32 before
+        @test 0 < QuasiMonteCarlo.bits2unif(T, fill(b - 1, pad), b) < 1
+        @test 0 < QuasiMonteCarlo.bits2unif(T, zeros(Int, pad), b) < 1
+    end
+end
+
+@testset "Scrambled points stay strictly inside (0, 1)" begin
+    # with pad = m, each coordinate has one point in every cell of width b^-m, including
+    # [0, b^-m[ and [1 - b^-m, 1[
+    d = 5
+    cases = [
+        (T, sampler, b, m, R)
+            for T in (Float32, Float64)
+            for (sampler, b, m) in ((SobolSample, 2, 6), (FaureSample, 5, 3))
+            for R in (OwenScramble, MatousekScramble, DigitalShift)
+    ]
+    for (T, sampler, b, m, R) in cases
+        x = QuasiMonteCarlo.sample(b^m, d, sampler(R = R(base = b, pad = m)), T)
+        @test eltype(x) == T
+        @test all(u -> 0 < u < 1, x)
+    end
 end
 
 @testset "Randomized Quasi Monte Carlo" begin
@@ -557,6 +636,7 @@ end
         OwenScramble(base = base, pad = m),
         MatousekScramble(base = base, pad = m),
         DigitalShift(base = base, pad = m),
+        HashOwenScramble(base = base, pad = m),
     ]
     pass = Array{Bool}(undef, length(v), m)
     for (s, t) in enumerate(t_sobol[1:m])
@@ -578,7 +658,7 @@ end
     λ = 1
     t = 0
 
-    pass = Array{Bool}(undef, 4, m)
+    pass = Array{Bool}(undef, 5, m)
     for s in 1:m
         net = Rational{BigInt}.(QuasiMonteCarlo.sample(nextprime(s)^m, s, FaureSample())) # Convert the sequence in Rational{BigInt} (needed to scramble)
         pass[1, s] = istmsnet(
@@ -600,6 +680,203 @@ end
             randomize(net, DigitalShift(base = nextprime(s), pad = m));
             λ, t, m, s, base = nextprime(s)
         )
+        pass[5, s] = istmsnet(
+            randomize(net, HashOwenScramble(base = nextprime(s), pad = m));
+            λ, t, m, s, base = nextprime(s)
+        )
     end
     @test all(pass)
+end
+
+@testset "HashOwenScramble scrambles each point on its own" begin
+    shared_digits(x, y) = something(findfirst(x .!= y), length(x) + 1) - 1
+    # A nested scramble maps the digit strings of the grid {k / bᵖᵃᵈ} onto themselves and
+    # keeps the number of leading digits any two points share. Checked on the digits, as
+    # `unif2bits` does not round-trip every base-3 fraction.
+    for (b, pad) in ((2, 10), (3, 6))
+        grid = stack(reverse(digits(k; base = b, pad)) for k in 0:(b^pad - 1))
+        origin = reshape(grid, pad, :, 1)
+        scramble(seed) = QuasiMonteCarlo.randomize_bits!(similar(origin), origin, HashOwenScramble(base = b, pad = pad, rng = Xoshiro(seed)))[:, :, 1]
+        scrambled = scramble(3)
+        @test sort(collect(eachcol(scrambled))) == sort(collect(eachcol(grid)))
+        mapped = collect(zip(eachcol(grid), eachcol(scrambled)))
+        @test all(
+            shared_digits(x, y) == shared_digits(x̃, ỹ)
+                for (x, x̃) in Iterators.take(mapped, 100), (y, ỹ) in mapped
+        )
+        # Unlike a digital shift, the last digit's shift varies with the digits above it.
+        @test length(unique(mod.(scrambled[end, :] .- grid[end, :], b))) > 1
+        @test scrambled != scramble(4)
+    end
+
+    # Any point count, and a longer sample keeps the points of a shorter one.
+    points = QuasiMonteCarlo.sample(1000, 3, SobolSample())
+    R(seed) = HashOwenScramble(base = 2, pad = 32, rng = Xoshiro(seed))
+    long = randomize(points, R(1))
+    @test randomize(points[:, 1:37], R(1)) == long[:, 1:37]
+    @test all(0 .<= long .< 1)
+
+    # Each scrambled point is uniform: its mean over 4000 seeds is within 4 standard errors of ½.
+    draws = [randomize(points[:, 1:2], R(seed))[1, 2] for seed in 1:4000]
+    @test abs(mean(draws) - 0.5) < 4 * sqrt(1 / 12 / length(draws))
+end
+
+@testset "HashOwenScramble on packed digit words" begin
+    d, n = 4, 300
+    sobol = SobolSeq(d).m .<< (32 .- (1:32)')
+    R(seed; pad = 32) = HashOwenScramble(base = 2, pad = pad, rng = Xoshiro(seed))
+    """The digit-array path every ScrambleMethod shares, on the d × n points `x`."""
+    function digit_array_scramble(x, R)
+        random_x = permutedims(copy(x))
+        invoke(
+            QuasiMonteCarlo.randomize!,
+            Tuple{AbstractMatrix{eltype(x)}, AbstractMatrix{eltype(x)}, ScrambleMethod},
+            random_x, permutedims(x), R
+        )
+        return permutedims(random_x)
+    end
+
+    words = QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol), UInt32)
+    points = QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol))
+    @test words ./ 2.0^32 == points
+    wide = QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol), UInt64)
+    @test wide == UInt64.(words) .<< 32
+
+    # Bit for bit at pad = 32: the words, the floats routed through words, and the digit
+    # arrays. A float scramble is the midpoint of its cell, half a last digit above the word.
+    for seed in 1:3
+        reference = digit_array_scramble(points, R(seed))
+        @test (randomize(words, R(seed)) .+ 0.5) ./ 2.0^32 == reference
+        @test (randomize(wide, R(seed)) .+ 2.0^31) ./ 2.0^64 == reference
+        @test randomize(points, R(seed)) == reference
+    end
+    # A shorter pad clears the digits after it; Float32 holds the leading 24 digits exactly.
+    single = Float32.(words .>> 8) ./ 2.0f0^24
+    @test (randomize(words, R(5; pad = 20)) .+ 2.0f0^11) ./ 2.0f0^32 == digit_array_scramble(single, R(5; pad = 20))
+    @test randomize(single, R(5; pad = 20)) == digit_array_scramble(single, R(5; pad = 20))
+    # At pad = 24 the midpoint needs a 25th digit, so both paths keep 23 digits.
+    @test randomize(single, R(5; pad = 24)) == digit_array_scramble(single, R(5; pad = 24))
+
+    scrambled(count) = QuasiMonteCarlo.sample(count, d, DigitalNetSample(sobol; R = R(7)), UInt32)
+    # A longer scrambled sample keeps the points of a shorter one.
+    @test scrambled(n)[:, 1:37] == scrambled(37)
+    @test (scrambled(n) .+ 0.5) ./ 2.0^32 == QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol; R = R(7)))
+
+    @test_throws ArgumentError randomize(words, HashOwenScramble(base = 3, pad = 20))
+    @test_throws ArgumentError randomize(words, R(1; pad = 33))
+    @test_throws ArgumentError QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol; R = OwenScramble(base = 2)), UInt32)
+end
+
+"""`count` points of the first `dims` dimensions of the net with `generating_matrices`, scrambled by `Scramble`."""
+function scrambled_words(generating_matrices, Scramble, count, dims, seed, pad)
+    R = Scramble(base = 2, pad = pad, rng = Xoshiro(seed))
+    return QuasiMonteCarlo.sample(count, dims, DigitalNetSample(generating_matrices; R), UInt32)
+end
+
+"""The sorted numbers of points in each box of the grid that splits dimension `s` into `2^splits[s]` cells."""
+function box_counts(words, splits)
+    counts = Dict{Vector{UInt32}, Int}()
+    for point in eachcol(words)
+        box = UInt32[word >> (32 - split) for (word, split) in zip(point, splits)]
+        counts[box] = get(counts, box, 0) + 1
+    end
+    return sort!(collect(values(counts)))
+end
+
+@testset "$Scramble scrambles a digital net into a shifted digital net" for Scramble in (MatousekScramble, DigitalShift)
+    d, m = 4, 6
+    n = 2^m
+    sobol = SobolSeq(d).m .<< (32 .- (1:32)')
+    plain = QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol), UInt32)
+    words = scrambled_words(sobol, Scramble, n, d, 3, 32)
+    @test words != plain
+
+    # Scrambling the generating matrices is the scramble of the points, for the same draws.
+    for pad in (32, 20, 5)
+        scramble = Scramble(base = 2, pad = pad, rng = Xoshiro(3))
+        @test QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol; R = scramble)) ==
+            randomize(QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol)), Scramble(base = 2, pad = pad, rng = Xoshiro(3)))
+    end
+
+    # Affine over GF(2): a ⊕ b ⊕ (any point) is again a point, so the points of each
+    # dimension are a shifted subspace of dimension m.
+    for dimension in axes(words, 1)
+        points = Set(words[dimension, :])
+        anchor = words[dimension, begin]
+        @test length(points) == n
+        @test all((a ⊻ b ⊻ anchor) in points for a in points for b in points)
+    end
+
+    # A longer sample keeps the points of a shorter one, and a wider one the dimensions of a
+    # narrower one; the digits after `pad` are cleared.
+    @test scrambled_words(sobol, Scramble, 2n, d, 3, 32)[:, 1:37] == scrambled_words(sobol, Scramble, 37, d, 3, 32)
+    @test scrambled_words(sobol, Scramble, n, d, 3, 32)[1:2, :] == scrambled_words(sobol, Scramble, n, 2, 3, 32)
+    @test all(iszero, scrambled_words(sobol, Scramble, n, d, 3, 20) .& 0x00000fff)
+
+    # The leading digits of a scrambled point depend on the leading digits alone.
+    cells = rand(Xoshiro(1), 0:(2^10 - 1), 1, 200)
+    coarse = (cells .+ rand(Xoshiro(2), 0:(2^22 - 1), 1, 200) ./ 2^22) ./ 2^10
+    fine = (cells .+ rand(Xoshiro(3), 0:(2^22 - 1), 1, 200) ./ 2^22) ./ 2^10
+    leading = Scramble(base = 2, pad = 32, rng = Xoshiro(4))
+    @test floor.(Int, randomize(coarse, leading) .* 2^10) == floor.(Int, randomize(fine, Scramble(base = 2, pad = 32, rng = Xoshiro(4))) .* 2^10)
+    @test randomize(coarse, Scramble(base = 2, pad = 32, rng = Xoshiro(4))) != randomize(fine, Scramble(base = 2, pad = 32, rng = Xoshiro(4)))
+
+    # Box counts are those of the unscrambled net: one point per elementary interval in the
+    # first two dimensions, and the same counts as the unscrambled net in all four.
+    for first_digits in 0:m
+        @test box_counts(words[1:2, :], (first_digits, m - first_digits)) == ones(Int, n)
+    end
+    for splits in Iterators.product(fill(0:m, d)...)
+        sum(splits) == m || continue
+        @test box_counts(words, splits) == box_counts(plain, splits)
+    end
+
+    # Each scrambled point is uniform: its mean over 4000 seeds is within 4 standard errors of ½.
+    draws = [scrambled_words(sobol, Scramble, 2, 1, seed, 32)[1, 2] / 2.0^32 for seed in 1:4000]
+    @test abs(mean(draws) - 0.5) < 4 * sqrt(1 / 12 / length(draws))
+
+    @test_throws ArgumentError scrambled_words(sobol, Scramble, n, d, 3, 33)
+    @test_throws ArgumentError QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol; R = Scramble(base = 3, pad = 20)), UInt32)
+end
+
+@testset "$Scramble held as scrambled generating matrices and shifts samples the same points" for Scramble in (MatousekScramble, DigitalShift)
+    d, n = 4, 64
+    sobol = SobolSeq(d).m .<< (32 .- (1:32)')
+    for pad in (32, 20)
+        direct = QuasiMonteCarlo.sample(n, d, DigitalNetSample(sobol; R = Scramble(base = 2, pad = pad, rng = Xoshiro(3))), UInt32)
+        matrices, shifts = QuasiMonteCarlo.scramble_generators(sobol, d, Scramble(base = 2, pad = pad, rng = Xoshiro(3)))
+        held = DigitalNetSample(matrices; shift = shifts)
+        @test QuasiMonteCarlo.sample(n, d, held, UInt32) == direct
+        # A longer sample keeps a shorter one's points, and fewer dimensions the leading ones.
+        @test QuasiMonteCarlo.sample(2n, d, held, UInt32)[:, 1:n] == direct
+        @test QuasiMonteCarlo.sample(n, 2, held, UInt32) == direct[1:2, :]
+        # Floats are the left ends of the cells of the leading 32 digits.
+        @test QuasiMonteCarlo.sample(n, d, held, Float64) == Float64.(direct) ./ 2.0^32
+    end
+    sobol_held = DigitalNetSample(sobol; shift = zeros(UInt32, d - 1))
+    @test_throws ArgumentError QuasiMonteCarlo.sample(n, d, sobol_held, UInt32)
+    @test_throws ArgumentError DigitalNetSample(sobol; R = Scramble(base = 2, pad = 32), shift = zeros(UInt32, d))
+end
+
+@testset "MatousekScramble and DigitalShift do not depend on the thread count" begin
+    d = 4
+    sobol = SobolSeq(d).m .<< (32 .- (1:32)')
+    for Scramble in (MatousekScramble, DigitalShift)
+        serial = [scrambled_words(sobol, Scramble, 64, d, seed, 32) for seed in 1:8]
+        tasks = [Threads.@spawn(scrambled_words(sobol, Scramble, 64, d, seed, 32)) for seed in 1:8]
+        @test fetch.(tasks) == serial
+    end
+
+    # Whole processes with one thread and with four give the same points.
+    script = """
+    using QuasiMonteCarlo, Random, Sobol
+    sobol = SobolSeq(4).m .<< (32 .- (1:32)')
+    for Scramble in (MatousekScramble, DigitalShift)
+        R = Scramble(base = 2, pad = 32, rng = Xoshiro(5))
+        println(join(QuasiMonteCarlo.sample(64, 4, DigitalNetSample(sobol; R), UInt32), ","))
+    end
+    """
+    project = dirname(Base.active_project())
+    output(threads) = read(`$(Base.julia_cmd()) --project=$project -t $threads -e $script`, String)
+    @test output(1) == output(4)
 end

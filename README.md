@@ -36,14 +36,7 @@ s = QuasiMonteCarlo.sample(n, lb, ub, LatticeRuleSample())
 s = QuasiMonteCarlo.sample(n, lb, ub, HaltonSample())
 ```
 
-The output `s` is a matrix, so one can use things like `@uview` from
-[UnsafeArrays.jl](https://github.com/oschulz/UnsafeArrays.jl) for a stack-allocated
-view of the `i`th point:
-
-```julia
-using UnsafeArrays
-@uview s[:, i]
-```
+The output `s` is a matrix.
 
 ## API
 
@@ -91,6 +84,7 @@ Sampling methods `SamplingAlgorithm` are divided into two subtypes
     
       + `GridSample` for samples on a regular grid.
       + `SobolSample` for the Sobol sequence.
+      + `DigitalNetSample` for a base-2 digital net with user-supplied generating matrices, e.g. from LatNet Builder.
       + `FaureSample` for the Faure sequence.
       + `LatticeRuleSample` for a randomly-shifted rank-1 lattice rule.
       + `HaltonSample` for the Halton sequence.
